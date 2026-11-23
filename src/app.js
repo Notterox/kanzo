@@ -38,6 +38,9 @@ const state = {
   guests: null,
   selected: new Set(),
   sweeping: false,
+  // The project's wiki is on screen instead of its tasks, at page `page` (an id).
+  wiki: false,
+  page: null,
 };
 
 // A joined board's page reaches the shared board under /remote.
@@ -177,6 +180,18 @@ const ICONS = {
   waits: '<path d="M6 3h12M6 21h12M7 3v4l5 5 5-5V3M7 21v-4l5-5 5 5v4"/>',
   news: '<path d="M12 3l2.6 5.6 6.1.7-4.5 4.2 1.2 6-5.4-3-5.4 3 1.2-6-4.5-4.2 6.1-.7z"/>',
   comment: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  bold: '<path d="M6 12h9a4 4 0 0 1 0 8H6V4h8a4 4 0 0 1 0 8"/>',
+  italic: '<path d="M19 4h-9M14 20H5M15 4 9 20"/>',
+  strike: '<path d="M16 4H9a3 3 0 0 0-2.83 4M14 12a4 4 0 0 1 0 8H6M4 12h16"/>',
+  code: '<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
+  ul: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  ol: '<path d="M10 6h11M10 12h11M10 18h11M4 6h1v4M4 10h2M6 18H4c0-1 2-2 2-3s-1-1.5-2-1"/>',
+  checklist: '<path d="m3 17 2 2 4-4M3 7l2 2 4-4M13 6h8M13 12h8M13 18h8"/>',
+  table: '<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18M3 15h18M12 3v18"/>',
+  hr: '<path d="M3 12h18"/>',
+  spell: '<path d="m6 16 6-12 6 12"/><path d="M8 12h8"/><path d="m16 20 2 2 4-4"/>',
+  book: '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
+  page: '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4M10 13h6M10 17h6M8 9h2"/>',
   share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4M15.4 6.5l-6.8 4"/>',
 };
 
@@ -335,11 +350,11 @@ function markdown(src) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     let m;
-    if ((m = line.match(/^\s*```/))) {
+    if ((m = line.match(/^\s*```\s*([^\s`]*)/))) {
       flushPara(); flushList();
       const code = [];
       while (++i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i]);
-      out.push(`<pre><code>${code.join("\n")}</code></pre>`);
+      out.push(`<pre${m[1] ? ` data-lang="${m[1]}"` : ""}><code>${code.join("\n")}</code></pre>`);
     } else if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
       flushPara(); flushList();
       const n = Math.min(m[1].length, 4);
@@ -416,7 +431,8 @@ async function loadBoard() {
 
 // The shared board's projects start with @, as its slugs can be this computer's too.
 function updateHash() {
-  const hash = "#" + (state.on === "shared" ? "@" : "") + state.project + (state.task ? "/" + state.task : "");
+  const rest = wikiOn() ? "/wiki" + (state.page ? "/" + state.page : "") : state.task ? "/" + state.task : "";
+  const hash = "#" + (state.on === "shared" ? "@" : "") + state.project + rest;
   if (location.hash !== hash) history.replaceState(null, "", hash);
 }
 
@@ -424,8 +440,10 @@ function readHash() {
   let hash = location.hash.slice(1);
   try { hash = decodeURIComponent(hash); } catch {}
   const shared = hash.startsWith("@");
-  const [slug, task] = hash.slice(shared ? 1 : 0).split("/");
-  return { slug: slug || null, task: Number(task) || null, board: shared ? "shared" : "local" };
+  const [slug, second, third] = hash.slice(shared ? 1 : 0).split("/");
+  const wiki = second === "wiki";
+  return { slug: slug || null, task: wiki ? null : Number(second) || null, wiki, page: wiki ? Number(third) || null : null,
+           board: shared ? "shared" : "local" };
 }
 
 function setProject(slug, board = state.on) {
@@ -437,6 +455,11 @@ function setProject(slug, board = state.on) {
     state.on = board;
     state.changes = null;
     state.board = state.board && { ...state.board, projects: [], tasks: [] };
+  }
+  if (state.project !== slug || board !== state.on) {
+    leaveEditor();
+    state.page = null;
+    if (slug === "all") state.wiki = false;
   }
   state.project = slug;
   localStorageSet("kanzo.project", (board === "shared" ? "@" : "") + slug);
@@ -467,7 +490,12 @@ async function loadOther() {
 function render() {
   renderNav();
   renderHeader();
-  renderColumns();
+  if (wikiOn()) {
+    showWiki();
+  } else {
+    $("#wiki-view").hidden = true;
+    renderColumns();
+  }
 }
 
 function renderNav() {
@@ -486,8 +514,12 @@ function renderNav() {
   const item = (board) => (p) => renaming && renaming.slug === p.slug && board === state.on
     ? el("div", { class: "item renaming" }, icon("folder", projectColor(p.slug, board)), renaming.input)
     : board !== state.on ? el("div", { class: "item" }, link(board, p.slug, p.name, p.open, icon("folder", projectColor(p.slug, board))))
-    : el("div", { class: "item" + (state.menu === p.slug ? " menu-open" : ""), draggable: "true", "data-slug": p.slug },
+    : el("div", { class: "item" + (state.menu === p.slug ? " menu-open" : "") + (wikiOf(p.slug, board) ? " wiki-on" : ""),
+                  draggable: "true", "data-slug": p.slug },
     link(board, p.slug, p.name, p.open, icon("folder", projectColor(p.slug, board))),
+    el("button", { class: "wiki-open", title: tr(wikiOf(p.slug, board) ? "Back to the tasks" : "Wiki"),
+                   "aria-label": tr("Wiki of {0}", p.name), "aria-pressed": String(wikiOf(p.slug, board)),
+                   onclick: () => toggleWikiOf(p.slug, board) }, icon("book")),
     el("button", { class: "more", title: tr("More"), "aria-label": tr("More for {0}", p.name), "aria-haspopup": "menu",
                    onclick: (e) => toggleProjectMenu(p, e.currentTarget) }, icon("more")));
   const all = (board, projects) => link(board, "all", tr("All projects"), projects.reduce((n, p) => n + p.open, 0), icon("board"));
@@ -683,25 +715,37 @@ function renderHeader() {
       el("button", { type: "button", title: tr(`Remove "{0}"`, f), "aria-label": tr("Remove the filter {0}", f),
                      onclick: () => setFilters(savedFilters().filter((_, j) => j !== i)) }, icon("close")))));
   $("#human-only").setAttribute("aria-pressed", String(isHumanOnly()));
+  const wiki = wikiOn();
+  $("#new-page").hidden = !wiki;
+  $("#filters").hidden = wiki;
+  if (wiki) for (const id of ["#new-task", "#human-only", "#filter-box", "#view"]) $(id).hidden = true;
   if (!projects.length) { header.replaceChildren(); return; }
   const open = (n) => plural(n, "open task");
   if (!p) {
     const count = projects.reduce((n, p) => n + p.open, 0);
-    header.replaceChildren(el("h1", {}, tr("All projects")),
-      el("span", { class: "sub" }, tr("{0} in {1}", open(count), plural(projects.length, "project"))));
+    header.replaceChildren(el("div", { class: "title" }, el("h1", {}, tr("All projects")),
+      el("span", { class: "sub" }, tr("{0} in {1}", open(count), plural(projects.length, "project")))));
     return;
   }
+  // Under the title, the project's two views: its tasks and its wiki.
+  const tab = (name, label, on, title, onclick) =>
+    el("button", { class: "tab", role: "tab", "aria-selected": String(on), title, onclick }, icon(name), label);
   header.replaceChildren(
-    el("h1", {}, p.name),
-    el("span", { class: "sub" }, open(p.open)),
-    ...p.repos.map((r) => el("a", { class: "repo-link", href: `https://github.com/${r}`, target: "_blank", rel: "noopener",
-                                    title: tr("Open {0} on GitHub", r) }, icon("github"), r)),
+    el("div", { class: "title" },
+      el("h1", {}, p.name),
+      el("span", { class: "sub" }, wiki ? plural(p.pages, "wiki page") : open(p.open)),
+      ...p.repos.map((r) => el("a", { class: "repo-link", href: `https://github.com/${r}`, target: "_blank", rel: "noopener",
+                                      title: tr("Open {0} on GitHub", r) }, icon("github"), r))),
+    el("div", { class: "view-tabs", role: "tablist", "aria-label": tr("View") },
+      tab("board", tr("Tasks"), !wiki, tr("Tasks (w)"), () => setWiki(false)),
+      tab("book", tr("Wiki"), wiki, tr("Wiki (w)"), () => setWiki(true))),
   );
 }
 
 async function deleteProject(p) {
   const tasks = p.total ? tr(" and its {0}, with their comments", plural(p.total, "task")) : "";
-  if (!(await ask(tr("Delete project {0}{1}? This cannot be undone.", p.slug, tasks)))) return;
+  const pages = p.pages ? tr(", and its {0}", plural(p.pages, "wiki page")) : "";
+  if (!(await ask(tr("Delete project {0}{1}{2}? This cannot be undone.", p.slug, tasks, pages)))) return;
   try {
     await api("DELETE", `/projects/${encodeURIComponent(p.slug)}`);
     if (panelTask?.project === p.slug) { fresh = null; closeTask(); }
@@ -1337,6 +1381,7 @@ const taskLink = (t) => el("button", { type: "button", class: "tag", title: key(
 
 async function openTask(id) {
   if (state.menu === PROJECT_PICK_MENU) closeMenu();
+  if (state.wiki) setWiki(false);
   clearSelection();
   leavePanelField();
   if (fresh !== id) dropFresh();
@@ -1520,7 +1565,7 @@ function leaveField(e) {
 }
 
 // A page can't open a file: link, so the board does, on the computer it runs on.
-panel.addEventListener("click", async (e) => {
+async function openFileLink(e) {
   const link = e.target.closest('a[href^="file:///"]');
   if (!link) return;
   e.preventDefault();
@@ -1528,7 +1573,8 @@ panel.addEventListener("click", async (e) => {
     const path = decodeURIComponent(link.getAttribute("href").slice(7)).replace(/^\/([a-zA-Z]:)/, "$1");
     await api("POST", "/open", { path }, "local");
   } catch (err) { toast(err.message); }
-});
+}
+panel.addEventListener("click", openFileLink);
 
 // "" is the default width. A drag saves and refits only when it ends: browsers send one move a frame.
 function setPanelWidth(width, save) {
@@ -1877,15 +1923,789 @@ document.addEventListener("keydown", (e) => {
     openSearch();
   }
   if (e.key === "n" && plain && !$("#new-task").hidden) { e.preventDefault(); newTask(); }
+  if (e.key === "n" && plain && wikiOn()) { e.preventDefault(); newPage(); }
+  if (e.key === "e" && plain && wikiOn() && doc) { e.preventDefault(); focusEnd(doc.surface); }
+  if (e.key === "w" && plain && state.board && currentProject()) { e.preventDefault(); setWiki(!wikiOn()); }
   if (e.key === "f" && plain && !$("#filter-box").hidden) { e.preventDefault(); $("#filter").focus(); }
   if (e.key === "h" && plain && !$("#human-only").hidden) { e.preventDefault(); setHumanOnly(!isHumanOnly()); }
 });
 
 window.addEventListener("hashchange", () => {
-  const { slug, task, board } = readHash();
+  const { slug, task, board, wiki, page } = readHash();
   if ((slug || "all") !== state.project || board !== state.on) setProject(slug || "all", board);
+  if (wiki !== wikiOn() || (wiki && page !== state.page)) setWiki(wiki, page);
   if (task && task !== state.task) openTask(task);
   else if (!task && state.task) closeTask();
+});
+
+// The wiki: each project's markdown pages, which agents read and write too. As in a notes
+// app, the page on screen is always open for editing and saves itself a moment after the
+// typing stops. Others' changes show up as they land, unless they'd overwrite unsaved typing.
+let wikiPages = [];
+// The server's copy of the page on screen.
+let wikiPage = null;
+// Every page's id by its lowercased title, for [[links]]; a filtered list leaves it alone.
+let wikiIndex = new Map();
+let wikiRequest = 0, wikiLoadedFor = null, wikiTimer;
+// Until a project's first list arrives, its wiki shows nothing rather than "no pages".
+let wikiLoaded = false;
+// The page being edited on screen; see `openDoc`.
+let doc = null;
+const SAVE_AFTER = 800;
+
+function wikiOn() {
+  return state.wiki && state.project !== "all";
+}
+
+function setWiki(on, page = null) {
+  if (on && state.project === "all") on = false;
+  if (on && state.task) closeTask();
+  // Back from the board, the wiki opens on the page it showed last.
+  if (on && !state.wiki && page == null && wikiPage && wikiLoadedFor === state.on + "/" + state.project) page = wikiPage.id;
+  if (!on || page !== state.page) leaveEditor();
+  clearSelection();
+  state.wiki = on;
+  state.page = on ? page : null;
+  state.layout = "";
+  updateHash();
+  if (state.board) render();
+  if (on) loadWiki();
+}
+
+function showWiki() {
+  $("#columns").hidden = $("#list").hidden = $("#list-tools").hidden = true;
+  $("#wiki-view").hidden = false;
+  const key = state.on + "/" + state.project;
+  if (wikiLoadedFor === key) return renderWiki();
+  leaveEditor();
+  wikiLoadedFor = key;
+  wikiLoaded = false;
+  wikiPages = [];
+  wikiPage = null;
+  wikiIndex = new Map();
+  $("#wiki-filter").value = "";
+  renderWiki();
+  loadWiki();
+}
+
+async function loadWiki() {
+  if (!wikiOn()) return;
+  const request = ++wikiRequest;
+  const slug = state.project, board = state.on;
+  const q = $("#wiki-filter").value.trim();
+  try {
+    const pages = await api("GET", `/projects/${encodeURIComponent(slug)}/wiki` + (q ? "?q=" + encodeURIComponent(q) : ""));
+    // The first page, when none is asked for and nobody is looking for one.
+    const id = state.page ?? (q ? null : pages[0]?.id ?? null);
+    let page = null;
+    if (id != null) {
+      try { page = await api("GET", `/wiki/${id}`); } catch (e) { if (!/no wiki page/.test(e.message)) throw e; }
+      if (page && page.project !== slug) page = null;
+    }
+    if (request !== wikiRequest || !wikiOn() || slug !== state.project || board !== state.on) return;
+    if (id != null && !page && state.page === id) toast(tr("That page was deleted"));
+    wikiPages = pages;
+    wikiLoaded = true;
+    if (!q) wikiIndex = new Map(pages.map((pg) => [pg.title.toLowerCase(), pg.id]));
+    wikiPage = page;
+    state.page = page ? page.id : null;
+    updateHash();
+    renderWiki();
+  } catch (e) {
+    if (request === wikiRequest) toast(e.message);
+  }
+}
+
+function renderWiki() {
+  renderWikiList();
+  renderWikiPage();
+}
+
+function renderWikiList() {
+  const q = $("#wiki-filter").value.trim();
+  const items = wikiPages.map((pg) => el("div", { class: "item" },
+    el("a", {
+        href: "#" + (state.on === "shared" ? "@" : "") + state.project + "/wiki/" + pg.id,
+        class: pg.id === state.page ? "active" : null,
+        title: pg.title, onclick: (e) => { e.preventDefault(); openPage(pg.id); } },
+      icon("page"),
+      el("span", { class: "name" }, pg.title)),
+    el("span", { class: "actions" },
+      el("button", { class: "danger", title: tr("Delete"), "aria-label": tr("Delete {0}", pg.title), onclick: () => deletePage(pg) },
+        icon("trash")))));
+  if (!items.length && wikiLoaded) items.push(el("p", { class: "hint" }, q ? tr("No pages match") : tr("No pages yet")));
+  $("#wiki-pages").replaceChildren(...items);
+}
+
+function renderWikiPage() {
+  const box = $("#wiki-page");
+  const pg = wikiPage;
+  if (!pg && !wikiLoaded) return box.replaceChildren();
+  if (!pg) {
+    leaveEditor();
+    box.replaceChildren(el("div", { class: "empty" },
+      el("h1", {}, wikiPages.length ? tr("Pick a page") : tr("No wiki pages yet")),
+      el("p", {}, tr("Notes that outlast a task: how to run things, decisions, gotchas. Agents read and write them too, with Kanzo's wiki tools.")),
+      el("button", { class: "btn primary", onclick: () => newPage() }, tr("New page"))));
+    return;
+  }
+  if (doc && doc.id === pg.id && box.contains(doc.root)) {
+    reconcile(doc, pg);
+    markLinks(doc.root);
+    return;
+  }
+  leaveEditor();
+  doc = openDoc(pg);
+  box.replaceChildren(doc.root);
+  box.scrollTop = 0;
+}
+
+// The page on screen, open for editing: what it holds now, what was last saved, and the
+// version that save was based on, so a save never undoes a change it didn't see.
+function openDoc(pg) {
+  const d = { id: pg.id, board: state.on, slug: state.project, version: pg.version,
+              title: pg.title, body: pg.body, saved: { title: pg.title, body: pg.body },
+              timer: null, saving: false, again: false, failed: false, theirs: null };
+  const title = el("input", { class: "wiki-title-input", "aria-label": tr("Page title"), placeholder: tr("Untitled"),
+                              autocomplete: "off", spellcheck: "false", maxlength: "120" });
+  title.value = pg.title;
+  title.addEventListener("input", () => { d.title = title.value; touch(d); });
+  title.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === "ArrowDown") { e.preventDefault(); focusEnd(d.surface, false); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); title.blur(); }
+  });
+  // An emptied title goes back to the last one; a page always has one.
+  title.addEventListener("blur", () => {
+    if (!title.value.trim()) { title.value = d.title = d.saved.title; }
+    save(d);
+  });
+  const keys = (e) => {
+    if ((e.key === "Enter" || e.key.toLowerCase() === "s") && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(d); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); e.target.blur(); }
+  };
+  const rich = richSurface(pg.body, () => { d.body = toMarkdown(rich.box); touch(d); }, keys);
+  let surface;
+  if (rich) {
+    surface = rich.box;
+  } else {
+    // Markdown the editor can't show as it looks is edited as it is, so none of it is lost.
+    surface = el("textarea", { class: "wiki-source wiki-surface", "aria-label": tr("Page text"), spellcheck: String(spellcheckOn()),
+                               placeholder: tr("Write in Markdown. Link other pages as [[Title]].") });
+    surface.value = pg.body;
+    const grow = () => { surface.style.height = "auto"; surface.style.height = surface.scrollHeight + "px"; };
+    surface.addEventListener("input", () => { d.body = surface.value; grow(); touch(d); });
+    surface.addEventListener("keydown", keys);
+    requestAnimationFrame(grow);
+  }
+  surface.addEventListener("blur", () => save(d));
+  d.surface = surface;
+  d.titleInput = title;
+  d.status = el("span", { class: "wiki-status" });
+  d.meta = el("span", {});
+  d.banner = el("div", { class: "wiki-banner", role: "status", hidden: true });
+  d.root = el("div", { class: "wiki-doc" },
+    el("div", { class: "wiki-head" },
+      title,
+      el("button", { class: "ghost danger", title: tr("Delete page"), "aria-label": tr("Delete page"),
+                     onclick: () => deletePage({ id: d.id, title: d.saved.title }) }, icon("trash")),
+      rich ? rich.toolbar : null),
+    el("div", { class: "wiki-meta" }, d.meta, d.status),
+    rich ? null : el("p", { class: "wiki-mode-note" },
+      tr("This page has formatting the editor can't show as it looks, so here it's plain markdown.")),
+    d.banner,
+    surface);
+  showMeta(d, pg);
+  markLinks(d.root);
+  return d;
+}
+
+const dirty = (d) => d.title !== d.saved.title || d.body !== d.saved.body;
+
+function showMeta(d, pg) {
+  const lines = pg.body ? pg.body.replace(/\n$/, "").split("\n").length : 0;
+  d.meta.replaceChildren(tr("Updated "), timeEl(pg.updated_at), pg.author ? " " + tr("by {0}", pg.author) : "",
+    " · ", plural(lines, "line"));
+}
+
+function setStatus(d, text) {
+  d.status.textContent = text ? " · " + text : "";
+}
+
+// A change was typed: it saves once the typing pauses.
+function touch(d) {
+  clearTimeout(d.timer);
+  if (d.theirs) return showTheirs(d);
+  setStatus(d, dirty(d) ? tr("Editing") : "");
+  if (dirty(d)) d.timer = setTimeout(() => save(d), SAVE_AFTER);
+}
+
+async function save(d) {
+  clearTimeout(d.timer);
+  if (d.saving) { d.again = true; return; }
+  if (!dirty(d) || d.theirs) return;
+  const sent = { title: d.title.trim() || d.saved.title, body: d.body };
+  d.saving = true;
+  setStatus(d, tr("Saving…"));
+  try {
+    const page = await api("PATCH", `/wiki/${d.id}`, { ...sent, version: d.version }, d.board);
+    d.version = page.version;
+    d.saved = { title: page.title, body: page.body };
+    d.failed = false;
+    if (doc === d) {
+      wikiPage = page;
+      setStatus(d, dirty(d) ? tr("Editing") : tr("Saved"));
+      showMeta(d, page);
+      // A new title shows in the list, and in links to the page.
+      const listed = wikiPages.find((p) => p.id === page.id);
+      if (listed && listed.title !== page.title) {
+        wikiIndex.delete(listed.title.toLowerCase());
+        listed.title = page.title;
+        wikiIndex.set(page.title.toLowerCase(), page.id);
+        renderWikiList();
+        markLinks(d.root);
+      }
+    }
+  } catch (e) {
+    if (/changed since you opened it/.test(e.message)) {
+      // Someone saved the page since this copy was loaded; the next load shows the choice.
+      d.theirs = true;
+      if (doc === d) { setStatus(d, tr("Not saved")); loadWiki(); }
+      else toast(tr("{0} changed elsewhere, so your last edits to it weren't saved.", d.saved.title));
+    } else if (/already exists/.test(e.message)) {
+      toast(e.message);
+      d.title = d.saved.title;
+      if (doc === d) { d.titleInput.value = d.title; setStatus(d, ""); }
+    } else {
+      d.failed = true;
+      if (doc === d) setStatus(d, tr("Not saved yet, retrying"));
+    }
+  } finally {
+    d.saving = false;
+    if (d.again) { d.again = false; save(d); }
+    else if (dirty(d) && !d.theirs) d.timer = setTimeout(() => save(d), d.failed ? 5000 : SAVE_AFTER);
+  }
+}
+
+// Another save landed. With nothing unsaved and nobody typing, the page simply updates; else
+// a bar asks which version to keep, so no one's work is thrown away unasked.
+function reconcile(d, pg) {
+  if (pg.version === d.version || d.saving) return;
+  const busy = d.root.contains(document.activeElement);
+  if (!dirty(d) && !busy) return reopen(pg);
+  d.theirs = pg;
+  showTheirs(d);
+}
+
+// The bar offering their version, and once there's typing of one's own, keeping that.
+function showTheirs(d) {
+  const pg = d.theirs;
+  if (!pg || pg === true) return;
+  const who = !pg.author || pg.author === "me" ? tr("Someone on the board") : pg.author;
+  d.banner.replaceChildren(
+    el("span", {}, dirty(d) ? tr("{0} changed this page while you were writing.", who) : tr("{0} changed this page.", who)),
+    el("button", { class: "btn", type: "button", onclick: () => reopen(pg) }, tr("Show their version")),
+    dirty(d) ? el("button", { class: "btn", type: "button", onclick: () => keepMine(d, pg) }, tr("Keep mine")) : null);
+  d.banner.hidden = false;
+  if (!d.saving) setStatus(d, dirty(d) ? tr("Not saved") : "");
+}
+
+function reopen(pg) {
+  const scroll = $("#wiki-page").scrollTop;
+  doc = null;
+  wikiPage = pg;
+  doc = openDoc(pg);
+  $("#wiki-page").replaceChildren(doc.root);
+  $("#wiki-page").scrollTop = scroll;
+}
+
+function keepMine(d, pg) {
+  d.version = pg.version;
+  d.theirs = null;
+  d.banner.hidden = true;
+  save(d);
+}
+
+// Leaving a page saves what's left to save.
+function leaveEditor() {
+  if (!doc) return;
+  const d = doc;
+  doc = null;
+  if (dirty(d) && !d.theirs) save(d);
+}
+
+function focusEnd(node, end = true) {
+  node.focus();
+  if (node.nodeName === "TEXTAREA") return;
+  const r = document.createRange();
+  r.selectNodeContents(node);
+  r.collapse(!end);
+  const s = getSelection();
+  s.removeAllRanges();
+  s.addRange(r);
+}
+
+// Links to pages not written yet look different; following one writes it.
+function markLinks(root) {
+  for (const a of root.querySelectorAll("a.wiki-link")) {
+    const missing = !wikiIndex.has(a.dataset.title.replace(/\s+/g, " ").trim().toLowerCase());
+    a.classList.toggle("missing", missing);
+    a.title = missing ? tr("Create {0}", a.dataset.title) : tr("Open {0}", a.dataset.title);
+  }
+}
+
+// [[Title]] links another page of the wiki; inside code it stays as typed.
+function wikiMarkdown(src) {
+  return markdown(src).split(/(<pre[^>]*>[\s\S]*?<\/pre>|<code>[\s\S]*?<\/code>)/).map((part, i) => i % 2 ? part
+    : part.replace(/\[\[([^[\]\n]+?)\]\]/g, (_, title) => `<a href="#" class="wiki-link" data-title="${title}">${title}</a>`)).join("");
+}
+
+// A click on a link follows it, even in the text being edited, as in a notes app; to change a
+// link's text, select it.
+$("#wiki-page").addEventListener("click", (e) => {
+  const a = e.target.closest("a");
+  if (!a || !getSelection().isCollapsed) return;
+  if (a.classList.contains("wiki-link")) {
+    e.preventDefault();
+    const title = a.dataset.title.replace(/\s+/g, " ").trim();
+    const id = wikiIndex.get(title.toLowerCase());
+    if (id != null) openPage(id); else newPage(title);
+    return;
+  }
+  if (a.matches('a[href^="file:///"]')) return openFileLink(e);
+  const href = a.getAttribute("href");
+  if (a.closest(".wiki-rich") && href && href !== "#") { e.preventDefault(); window.open(href, "_blank", "noopener"); }
+});
+
+const MOD = /Mac|iP(hone|ad|od)/.test(navigator.platform) ? "⌘" : "Ctrl+";
+
+// The browser's spell check underlines words as you write; off unless you turn it on, per browser.
+function spellcheckOn() {
+  return localStorageGet("kanzo.spellcheck") === "on";
+}
+
+function spellToggle(surfaces) {
+  const button = el("button", { type: "button", class: "spell", onmousedown: (e) => e.preventDefault() }, icon("spell"));
+  const show = () => {
+    const on = spellcheckOn();
+    button.setAttribute("aria-pressed", String(on));
+    button.title = on ? tr("Spell check is on") : tr("Spell check is off");
+    button.setAttribute("aria-label", tr("Spell check"));
+    for (const s of surfaces) s.spellcheck = on;
+  };
+  button.addEventListener("click", () => { localStorageSet("kanzo.spellcheck", spellcheckOn() ? "off" : "on"); show(); });
+  show();
+  return button;
+}
+
+// A contenteditable page with its toolbar, or null when `body` wouldn't come back the same.
+function richSurface(body, changed, keys) {
+  const html = wikiMarkdown(body);
+  const box = el("div", { class: "md wiki-rich wiki-surface", contenteditable: "true", role: "textbox",
+                          "aria-multiline": "true", "aria-label": tr("Page text"), spellcheck: String(spellcheckOn()),
+                          "data-placeholder": tr("Write here. Type # for a heading, - for a list, [] for a checklist.") });
+  box.innerHTML = html;
+  if (wikiMarkdown(toMarkdown(box)) !== html) return null;
+  if (!box.firstChild) box.innerHTML = "<p><br></p>";
+  for (const input of box.querySelectorAll("input[type=checkbox]")) input.disabled = false;
+  const blank = () => box.classList.toggle("blank", !box.textContent.trim() && !box.querySelector("hr, table, input"));
+  blank();
+
+  // Buttons keep the text's selection; fields like the link's take it, so it's kept here.
+  let saved = null;
+  const remember = () => {
+    const s = getSelection();
+    if (s.rangeCount && box.contains(s.anchorNode)) saved = s.getRangeAt(0).cloneRange();
+  };
+  const restore = () => {
+    box.focus();
+    if (saved) { const s = getSelection(); s.removeAllRanges(); s.addRange(saved); }
+  };
+  const exec = (cmd, value = null) => { restore(); document.execCommand(cmd, false, value); remember(); after(); };
+  const after = () => { blank(); changed(); syncStyle(); };
+  const blockAt = () => {
+    const s = getSelection();
+    let n = s.rangeCount ? s.anchorNode : null;
+    while (n && n !== box && !(n.nodeType === 1 && /^(P|DIV|H[1-6]|BLOCKQUOTE|PRE|LI)$/.test(n.nodeName))) n = n.parentNode;
+    return n && n !== box ? n : null;
+  };
+
+  const style = el("select", { class: "style", title: tr("Text style"), "aria-label": tr("Text style"),
+                               onmousedown: remember, onchange: () => { exec("formatBlock", style.value); } },
+    ...[["P", "Text"], ["H1", "Heading 1"], ["H2", "Heading 2"], ["H3", "Heading 3"], ["BLOCKQUOTE", "Quote"], ["PRE", "Code block"]]
+      .map(([v, label]) => el("option", { value: v }, tr(label))));
+  const syncStyle = () => {
+    let n = blockAt();
+    while (n && n.nodeName === "LI") n = null;
+    const tag = n ? n.nodeName : "P";
+    style.value = ["H1", "H2", "H3", "BLOCKQUOTE", "PRE"].includes(tag) ? tag : /^H[4-6]$/.test(tag) ? "H3" : "P";
+  };
+
+  const linkField = el("input", { class: "field", placeholder: "", autocomplete: "off", spellcheck: "false" });
+  const linkBar = el("div", { class: "wiki-linkbar", hidden: true }, linkField,
+    el("button", { class: "btn", type: "button", onclick: () => closeLink() }, tr("Cancel")));
+  let linking = null;
+  const openLink = (kind) => {
+    remember();
+    linking = kind;
+    linkField.value = kind === "page" && saved && !saved.collapsed ? saved.toString().trim() : "";
+    linkField.placeholder = kind === "page" ? tr("Page title") : tr("https://… or file:///…");
+    linkField.setAttribute("aria-label", kind === "page" ? tr("Title of the page to link") : tr("Link address"));
+    linkBar.hidden = false;
+    linkField.focus();
+    linkField.select();
+  };
+  const closeLink = (focus = true) => { linkBar.hidden = true; linking = null; if (focus) restore(); };
+  linkField.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeLink(); return; }
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    let value = linkField.value.trim();
+    const kind = linking;
+    closeLink(false);
+    if (!value) return restore();
+    const text = saved && !saved.collapsed ? saved.toString() : value;
+    if (kind === "page") {
+      const t = escapeHtml(value.replace(/\s+/g, " "));
+      exec("insertHTML", `<a href="#" class="wiki-link" data-title="${t}">${t}</a>`);
+    } else {
+      if (!/^(https?:\/\/|mailto:|file:\/\/\/)/i.test(value)) value = "https://" + value;
+      exec("insertHTML", `<a href="${escapeHtml(value)}">${escapeHtml(text)}</a>`);
+    }
+  });
+
+  const code = () => {
+    restore();
+    const s = getSelection();
+    const inCode = s.anchorNode && (s.anchorNode.nodeType === 1 ? s.anchorNode : s.anchorNode.parentNode).closest("code");
+    if (inCode && box.contains(inCode) && !inCode.closest("pre")) {
+      const r = document.createRange();
+      r.selectNode(inCode);
+      s.removeAllRanges();
+      s.addRange(r);
+      exec("insertText", inCode.textContent);
+      return;
+    }
+    const text = s.toString() || "code";
+    exec("insertHTML", `<code>${escapeHtml(text)}</code>&#8203;`);
+  };
+
+  const checklist = () => {
+    restore();
+    if (!blockAt()?.closest("ul")) document.execCommand("insertUnorderedList");
+    const li = blockAt()?.closest("li");
+    if (li) {
+      if (li.classList.contains("check")) {
+        li.classList.remove("check");
+        li.querySelector(":scope > input[type=checkbox]")?.remove();
+      } else {
+        li.classList.add("check");
+        li.prepend(el("input", { type: "checkbox" }), " ");
+        caretAtEnd(li);
+      }
+    }
+    remember();
+    after();
+  };
+  const caretAtEnd = (node) => {
+    const r = document.createRange();
+    r.selectNodeContents(node);
+    // Before a trailing <br>, which only keeps an empty line open.
+    if (node.lastChild?.nodeName === "BR") r.setEndBefore(node.lastChild);
+    r.collapse(false);
+    const s = getSelection();
+    s.removeAllRanges();
+    s.addRange(r);
+  };
+
+  const table = () => exec("insertHTML", `<div class="table"><table><thead><tr><th>${tr("Column")}</th><th>${tr("Column")}</th></tr></thead>`
+    + `<tbody><tr><td><br></td><td><br></td></tr></tbody></table></div><p><br></p>`);
+
+  const tool = (name, label, onclick) => el("button", { type: "button", title: label, "aria-label": label,
+                                                         onmousedown: (e) => e.preventDefault(), onclick }, icon(name));
+  const sep = () => el("span", { class: "sep" });
+  const toolbar = el("div", { class: "wiki-toolbar", role: "toolbar", "aria-label": tr("Formatting") },
+    style, sep(),
+    tool("bold", tr("Bold ({0}B)", MOD), () => exec("bold")),
+    tool("italic", tr("Italic ({0}I)", MOD), () => exec("italic")),
+    tool("strike", tr("Strikethrough"), () => exec("strikeThrough")),
+    tool("code", tr("Code"), code), sep(),
+    tool("url", tr("Link ({0}K)", MOD), () => openLink("url")),
+    tool("page", tr("Link a wiki page"), () => openLink("page")), sep(),
+    tool("ul", tr("Bulleted list"), () => exec("insertUnorderedList")),
+    tool("ol", tr("Numbered list"), () => exec("insertOrderedList")),
+    tool("checklist", tr("Checklist"), checklist), sep(),
+    tool("table", tr("Table"), table),
+    tool("hr", tr("Divider"), () => exec("insertHorizontalRule")),
+    el("span", { class: "spacer" }),
+    spellToggle([box]),
+    linkBar);
+
+  box.addEventListener("blur", remember);
+  box.addEventListener("keyup", () => { remember(); syncStyle(); });
+  box.addEventListener("mouseup", () => { remember(); syncStyle(); });
+  box.addEventListener("focus", () => document.execCommand("defaultParagraphSeparator", false, "p"));
+  // Ticking a box is a change too.
+  box.addEventListener("change", (e) => { if (e.target.matches("input[type=checkbox]")) after(); });
+  box.addEventListener("keydown", (e) => {
+    // Here it links the selection, rather than opening the board's search.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); e.stopPropagation(); openLink("url"); return; }
+    // Enter on an empty checklist item ends the list, as it does in any other list; the
+    // browser wouldn't, as the item still holds its checkbox.
+    const li = e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && blockAt()?.closest("li");
+    if (li && li.classList.contains("check") && !li.textContent.trim()) {
+      e.preventDefault();
+      const list = li.parentNode;
+      const rest = [];
+      for (let n = li.nextElementSibling; n; n = n.nextElementSibling) rest.push(n);
+      const p = el("p", {}, document.createElement("br"));
+      list.after(p);
+      if (rest.length) p.after(el(list.nodeName.toLowerCase(), {}, ...rest));
+      li.remove();
+      if (!list.children.length) list.remove();
+      caretAtEnd(p);
+      remember();
+      after();
+      return;
+    }
+    keys(e);
+  });
+  // Markdown typed at the start of a line becomes its format: "# ", "- ", "1. ", "[] ", "> ", "``` ".
+  box.addEventListener("input", (e) => {
+    // A new item after a checklist item is one too; the browser copies its class, not its checkbox.
+    if (e.inputType === "insertParagraph") {
+      const li = blockAt()?.closest("li");
+      if (li && li.classList.contains("check") && !li.querySelector(":scope > input[type=checkbox]")) {
+        li.prepend(el("input", { type: "checkbox" }), " ");
+        caretAtEnd(li);
+        remember();
+      }
+    }
+    if (e.inputType === "insertText" && e.data === " ") {
+      const block = blockAt();
+      const typed = block ? block.textContent.replace(/\u00a0/g, " ") : "";
+      const formats = { "# ": "H1", "## ": "H2", "### ": "H3", "> ": "BLOCKQUOTE", "``` ": "PRE",
+                        "- ": "UL", "* ": "UL", "1. ": "OL", "[] ": "CHECK", "[ ] ": "CHECK" };
+      const kind = block && block.nodeName !== "PRE" && formats[typed];
+      // In a list, only a checkbox can be started; elsewhere the line becomes the block.
+      if (kind && (block.nodeName !== "LI" || kind === "CHECK")) {
+        let target, caret;
+        if (block.nodeName === "LI") {
+          block.innerHTML = "<br>";
+          target = caret = block;
+          block.classList.add("check");
+          block.prepend(el("input", { type: "checkbox" }), " ");
+        } else if (["UL", "OL", "CHECK"].includes(kind)) {
+          caret = el("li", {});
+          if (kind === "CHECK") { caret.className = "check"; caret.append(el("input", { type: "checkbox" }), " "); }
+          caret.append(document.createElement("br"));
+          target = el(kind === "OL" ? "ol" : "ul", {}, caret);
+        } else {
+          target = caret = document.createElement(kind);
+          target.append(document.createElement("br"));
+        }
+        if (target !== block) block.replaceWith(target);
+        caretAtEnd(caret);
+        remember();
+        after();
+        return;
+      }
+    }
+    after();
+  });
+  // Pasted text comes in as text; several lines are read as markdown, so a pasted page keeps its form.
+  box.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain");
+    if (text == null) return;
+    e.preventDefault();
+    if (text.includes("\n")) document.execCommand("insertHTML", false, wikiMarkdown(text));
+    else document.execCommand("insertText", false, text);
+    after();
+  });
+  syncStyle();
+  return { box, toolbar };
+}
+
+// The markdown for an edited page: what `markdown` reads back as the same page.
+const INLINE_TAGS = new Set(["B", "STRONG", "I", "EM", "S", "STRIKE", "DEL", "CODE", "A", "SPAN", "FONT", "U", "BR",
+  "SUB", "SUP", "MARK", "SMALL", "INPUT", "LABEL"]);
+
+function toMarkdown(root) {
+  const blocks = [];
+  let loose = [];
+  const flush = () => { const t = inlineMd(loose).trim(); if (t) blocks.push(t); loose = []; };
+  for (const node of root.childNodes) {
+    if (node.nodeType === 3 || (node.nodeType === 1 && INLINE_TAGS.has(node.nodeName))) { loose.push(node); continue; }
+    if (node.nodeType !== 1) continue;
+    flush();
+    const md = blockMd(node);
+    if (md) blocks.push(md);
+  }
+  flush();
+  return blocks.join("\n\n");
+}
+
+function blockMd(node) {
+  const tag = node.nodeName;
+  const holdsBlocks = () => [...node.children].some((c) => !INLINE_TAGS.has(c.nodeName));
+  if (/^H[1-6]$/.test(tag)) return "#".repeat(Number(tag[1])) + " " + inlineMd(node.childNodes).replace(/\s*\n\s*/g, " ").trim();
+  switch (tag) {
+    case "UL": case "OL": return listMd(node);
+    case "PRE": {
+      const lang = node.dataset.lang || "";
+      return "```" + lang + "\n" + preText(node).replace(/\n$/, "") + "\n```";
+    }
+    case "HR": return "---";
+    case "TABLE": return tableMd(node);
+    case "BLOCKQUOTE": {
+      const text = holdsBlocks() ? toMarkdown(node) : inlineMd(node.childNodes).trim();
+      return text ? text.split("\n").map((l) => (l ? "> " + l : ">")).join("\n") : "";
+    }
+    default: {
+      if (node.classList?.contains("table")) { const t = node.querySelector("table"); return t ? tableMd(t) : ""; }
+      if (holdsBlocks()) return toMarkdown(node);
+      return inlineMd(node.childNodes).replace(/\n+$/, "").trim();
+    }
+  }
+}
+
+function listMd(list) {
+  let n = 1;
+  const lines = [];
+  for (const li of list.children) {
+    if (li.nodeName !== "LI") continue;
+    const box = li.querySelector(":scope > input[type=checkbox]");
+    // The board's markdown has no nested lists: a nested one goes on as items of this one.
+    const nested = [...li.children].filter((c) => c.nodeName === "UL" || c.nodeName === "OL");
+    const own = [...li.childNodes].filter((c) => c !== box && !nested.includes(c));
+    const text = inlineMd(own).replace(/\s*\n\s*/g, " ").trim();
+    const mark = list.nodeName === "OL" ? `${n++}.` : "-";
+    lines.push(`${mark} ${box ? `[${box.checked ? "x" : " "}] ` : ""}${text}`.trimEnd());
+    for (const sub of nested) lines.push(listMd(sub));
+  }
+  return lines.join("\n");
+}
+
+function tableMd(table) {
+  const rows = [...table.querySelectorAll("tr")];
+  if (!rows.length) return "";
+  const cells = (tr) => [...tr.children].map((c) => inlineMd(c.childNodes).replace(/\s*\n\s*/g, " ").trim().replace(/\|/g, "\\|"));
+  const align = [...rows[0].children].map((c) => ({ left: ":--", center: ":-:", right: "--:" })[c.style.textAlign] || "---");
+  const line = (cs) => "| " + cs.join(" | ") + " |";
+  return [line(cells(rows[0])), line(align), ...rows.slice(1).map((r) => line(cells(r)))].join("\n");
+}
+
+function preText(node) {
+  let out = "";
+  for (const n of node.childNodes) {
+    if (n.nodeType === 3) out += n.data;
+    else if (n.nodeName === "BR") out += "\n";
+    else if (n.nodeType === 1 && /^(DIV|P)$/.test(n.nodeName)) out += (out && !out.endsWith("\n") ? "\n" : "") + preText(n) + "\n";
+    else if (n.nodeType === 1) out += preText(n);
+  }
+  return out.replace(/\u00a0/g, " ").replace(/\u200b/g, "");
+}
+
+function inlineMd(nodes) {
+  // Marks hug their text, as `markdown` wants: `**bold** text`, not `** bold **text`.
+  const wrap = (mark, s) => {
+    const t = s.trim();
+    if (!t) return s;
+    return s.match(/^\s*/)[0] + mark + t + mark + s.match(/\s*$/)[0];
+  };
+  let out = "";
+  for (const n of nodes) {
+    if (n.nodeType === 3) { out += n.data.replace(/\u00a0/g, " ").replace(/\u200b/g, "").replace(/\s*\n\s*/g, " "); continue; }
+    if (n.nodeType !== 1) continue;
+    const inner = () => inlineMd(n.childNodes);
+    switch (n.nodeName) {
+      case "BR": out += "\n"; break;
+      case "B": case "STRONG": out += wrap("**", inner()); break;
+      case "I": case "EM": out += wrap("*", inner()); break;
+      case "S": case "STRIKE": case "DEL": out += wrap("~~", inner()); break;
+      case "CODE": { const t = n.textContent.replace(/`/g, "").replace(/\u200b/g, ""); if (t) out += "`" + t + "`"; break; }
+      case "INPUT": break;
+      case "A": {
+        if (n.classList.contains("wiki-link")) { const t = n.textContent.trim(); if (t) out += `[[${t}]]`; break; }
+        const href = n.getAttribute("href") || "", text = inner();
+        out += !href || href === "#" ? text : text.trim() === href ? href : `[${text.trim()}](${href})`;
+        break;
+      }
+      default: out += inner();
+    }
+  }
+  return out;
+}
+
+function openPage(id) {
+  if (id === state.page && doc) return;
+  leaveEditor();
+  state.page = id;
+  updateHash();
+  renderWikiList();
+  loadWiki();
+}
+
+// The sidebar's wiki button: opens that project's wiki, or goes back to its tasks.
+function wikiOf(slug, board) {
+  return wikiOn() && state.project === slug && state.on === board;
+}
+
+function toggleWikiOf(slug, board) {
+  if (wikiOf(slug, board)) return setWiki(false);
+  if (state.project !== slug || state.on !== board) setProject(slug, board);
+  setWiki(true);
+}
+
+// A new page is written at once, as "Untitled" with its title selected to type over, or
+// under the title a [[link]] gave it.
+async function newPage(title = "") {
+  if (!wikiOn()) return;
+  const slug = state.project;
+  let name = title || tr("Untitled");
+  for (let n = 2; !title && wikiIndex.has(name.toLowerCase()); n++) name = `${tr("Untitled")} ${n}`;
+  leaveEditor();
+  try {
+    const page = await api("POST", `/projects/${encodeURIComponent(slug)}/wiki`, { title: name, body: "" });
+    $("#wiki-filter").value = "";
+    state.page = page.id;
+    wikiPage = page;
+    wikiIndex.set(page.title.toLowerCase(), page.id);
+    updateHash();
+    renderWikiPage();
+    if (title) focusEnd(doc.surface); else { doc.titleInput.focus(); doc.titleInput.select(); }
+    loadWiki();
+    loadBoard();
+  } catch (e) {
+    // Someone made it a moment ago: open theirs.
+    const id = /already exists/.test(e.message) && wikiIndex.get(name.toLowerCase());
+    if (id != null && id !== false) openPage(id); else toast(e.message);
+  }
+}
+
+async function deletePage(pg) {
+  if (!(await ask(tr("Delete wiki page {0}? This cannot be undone.", pg.title)))) return;
+  try {
+    await api("DELETE", `/wiki/${pg.id}`);
+    if (doc?.id === pg.id) { clearTimeout(doc.timer); doc = null; }
+    if (state.page === pg.id) { state.page = null; wikiPage = null; }
+    loadWiki();
+    loadBoard();
+  } catch (err) { toast(err.message); }
+}
+
+$("#new-page").addEventListener("click", () => newPage());
+$("#wiki-filter").addEventListener("input", () => { clearTimeout(wikiTimer); wikiTimer = setTimeout(loadWiki, 150); });
+$("#wiki-filter").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && wikiPages[0]) { e.preventDefault(); openPage(wikiPages[0].id); }
+});
+// Closing the board mid-sentence still saves the sentence.
+window.addEventListener("pagehide", () => {
+  const d = doc;
+  if (!d || !dirty(d) || d.theirs) return;
+  fetch(base(d.board) + `/api/wiki/${d.id}`, {
+    method: "PATCH", keepalive: true, headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ title: d.title.trim() || d.saved.title, body: d.body, version: d.version }),
+  }).catch(() => {});
 });
 
 async function poll() {
@@ -1919,6 +2739,7 @@ async function poll() {
     state.changes = current.changes;
     await loadBoard();
     if (state.task) refreshTask();
+    if (wikiOn()) loadWiki();
   }
   if (state.joined && other && other.changes !== state.other?.changes) loadOther();
   schedulePoll();
@@ -2365,7 +3186,7 @@ loadDictionary().then(() => {
   loadNetwork();
   schedulePoll();
   {
-    let { slug, task, board } = readHash();
+    let { slug, task, board, wiki, page } = readHash();
     if (!slug) {
       const saved = localStorageGet("kanzo.project") || "all";
       board = saved.startsWith("@") ? "shared" : "local";
@@ -2377,6 +3198,8 @@ loadDictionary().then(() => {
       checkSharedUpdate();
       state.on = joined ? board : "local";
       state.project = joined || board === "local" ? slug : "all";
+      state.wiki = wiki && state.project !== "all";
+      state.page = state.wiki ? page : null;
       updateHash();
       loadOther();
       loadBoard().then(() => { if (task) openTask(task); });

@@ -25,10 +25,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::home::Home;
 use crate::share::{self, Net};
-use crate::store::{self, Error, Project, Store, Task, TaskPatch, short_time};
+use crate::store::{self, Error, Grep, Project, Store, Task, TaskPatch, short_time};
 
 /// An old board has thousands of done tasks.
 const DONE_LISTED: usize = 20;
+
+/// grep_wiki stops here, so a pattern that matches everything doesn't flood an agent's context.
+const GREP_MATCHES: usize = 60;
 
 macro_rules! instructions {
     ($whose:literal, $project:literal) => {
@@ -39,7 +42,7 @@ macro_rules! instructions {
             $project,
             " Keep it current unasked: doing when you start a task, comments on what you did, review when you \
              finish or get stuck, url for a PR you opened. On review, comment how to resume this session. Leave done and human tasks to the user. \
-             Link files as [name](file:///path)."
+             Link files as [name](file:///path). Each project has a wiki for lasting notes: grep_wiki, then read only the lines you need."
         )
     };
 }
@@ -55,7 +58,7 @@ pub async fn serve(home: Home) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let repos = git_repos(&cwd);
     let images = home.images();
-    let ctx = Ctx { home, cwd: Some(cwd), repos, images, host: Default::default() };
+    let ctx = Ctx { home, cwd: Some(cwd), repos, images, host: Default::default(), files: true };
     let server = Kanzo { ctx: Arc::new(ctx), tool_router: Kanzo::tools() };
     serve_stdio(server).await
 }
@@ -76,7 +79,7 @@ async fn serve_stdio(server: Kanzo) -> Result<()> {
 /// so rmcp's localhost-only list is turned off.
 pub fn http_service(home: Home, shutdown: CancellationToken) -> StreamableHttpService<Kanzo, LocalSessionManager> {
     let images = home.images();
-    let ctx = Arc::new(Ctx { home, cwd: None, repos: Vec::new(), images, host: Default::default() });
+    let ctx = Arc::new(Ctx { home, cwd: None, repos: Vec::new(), images, host: Default::default(), files: false });
     let config = StreamableHttpServerConfig::default().disable_allowed_hosts().with_cancellation_token(shutdown);
     // rmcp makes a server per session, and for some requests; the tool list is built once.
     let tool_router = Kanzo::tools();
@@ -93,9 +96,65 @@ struct Ctx {
     repos: Vec<String>,
     images: PathBuf,
     host: tokio::sync::Mutex<Option<share::Upstream>>,
+    /// Only `kanzo mcp`, which runs as the agent's own process, reads and writes files for it.
+    /// Over HTTP anyone who reaches the board could, so there it never does.
+    files: bool,
 }
 
+const FILES_HERE_ONLY: &str =
+    "file and to_file work only through `kanzo mcp`, on the agent's own computer; pass the text as body instead";
+
+const PAGE_FILE_TYPES: [&str; 3] = ["md", "markdown", "txt"];
+
 impl Ctx {
+    /// A file the agent named, for a page to be read from or, `new`, saved to. Kept to text
+    /// files in the folder the agent works in, where it writes anyway: whatever an agent is told,
+    /// it can't carry a key or a .env file into the wiki, where sync and sharing would take it
+    /// further, nor save a page over a startup script. Symlinks count where they lead.
+    fn page_path(&self, given: &str, new: bool) -> store::Result<PathBuf> {
+        let Some(cwd) = self.cwd.as_ref().filter(|_| self.files) else {
+            return Err(Error::Invalid(FILES_HERE_ONLY.into()));
+        };
+        let root = cwd
+            .canonicalize()
+            .map_err(|e| Error::Invalid(format!("cannot find the working folder {}: {e}", cwd.display())))?;
+        let given = given.trim();
+        let path = cwd.join(given);
+        let outside = || {
+            Error::Invalid(format!(
+                "{given} is outside {}, the folder this agent works in; Kanzo reads and writes files only there",
+                cwd.display()
+            ))
+        };
+        // Judged by its name first, so a path elsewhere gets the same answer whether or not it
+        // exists, and the error can't be used to find out what's on the disk.
+        if !lexically_within(&path, cwd) {
+            return Err(outside());
+        }
+        let real = if new {
+            if path.symlink_metadata().is_ok() {
+                return Err(Error::Invalid(format!(
+                    "{given} already exists; to_file only writes new files, so pick another name"
+                )));
+            }
+            let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+                return Err(Error::Invalid(format!("{given} is not a file name")));
+            };
+            let parent = parent.canonicalize().map_err(|e| Error::Invalid(format!("cannot write {given}: {e}")))?;
+            parent.join(name)
+        } else {
+            path.canonicalize().map_err(|e| Error::NotFound(format!("cannot read {given}: {e}")))?
+        };
+        if !real.starts_with(&root) {
+            return Err(outside());
+        }
+        let text = real.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+        if !text.is_some_and(|e| PAGE_FILE_TYPES.contains(&e.as_str())) {
+            return Err(Error::Invalid(format!("{given} is not a .md, .markdown or .txt file")));
+        }
+        Ok(real)
+    }
+
     fn scope(&self, store: &Store, name: Option<&str>) -> store::Result<Option<Project>> {
         if name.is_some_and(|p| p.trim().eq_ignore_ascii_case("all")) {
             return Ok(None);
@@ -133,6 +192,43 @@ impl Ctx {
         };
         Err(Error::NotFound(msg))
     }
+}
+
+/// Whether `path`, with its `..` and `.` worked out but symlinks not followed, is in `dir`.
+fn lexically_within(path: &std::path::Path, dir: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut parts: Vec<Component> = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(parts.last(), Some(Component::Normal(_))) {
+                    parts.pop();
+                } else {
+                    return false;
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.iter().collect::<PathBuf>().starts_with(dir)
+}
+
+/// A page's text from a file: UTF-8, with Windows line ends made plain.
+fn page_file(path: &std::path::Path) -> store::Result<String> {
+    let cannot = |e: std::io::Error| Error::NotFound(format!("cannot read {}: {e}", path.display()));
+    let size = std::fs::metadata(path).map_err(cannot)?.len();
+    if size > store::PAGE_MAX as u64 {
+        return Err(Error::Invalid(format!(
+            "{} is {} KB; a wiki page holds up to {} KB",
+            path.display(),
+            size / 1024,
+            store::PAGE_MAX / 1024
+        )));
+    }
+    let text = String::from_utf8(std::fs::read(path).map_err(cannot)?)
+        .map_err(|_| Error::Invalid(format!("{} is not UTF-8 text", path.display())))?;
+    Ok(text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n"))
 }
 
 fn reply(outcome: Result<String, String>) -> CallToolResult {
@@ -277,6 +373,65 @@ struct LinkRepoArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+struct WikiArgs {
+    /// Slug, or "all".
+    project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct PageArgs {
+    title: String,
+    /// Slug.
+    project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReadPageArgs {
+    title: String,
+    /// Slug.
+    project: Option<String>,
+    /// First line, from 1.
+    offset: Option<usize>,
+    /// How many lines.
+    limit: Option<usize>,
+    /// Save the page to a new .md file in your working folder instead of showing it, to edit it there.
+    to_file: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct WritePageArgs {
+    title: String,
+    /// Markdown; link pages as [[Title]].
+    body: Option<String>,
+    /// A .md or .txt file in your working folder to take the text from instead of body; much faster for long text.
+    file: Option<String>,
+    /// Slug.
+    project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct EditPageArgs {
+    title: String,
+    /// Exact text now in the page.
+    old: String,
+    new: String,
+    /// Replace every occurrence.
+    all: Option<bool>,
+    /// Slug.
+    project: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GrepWikiArgs {
+    /// Regex; ignores case unless it has a capital.
+    pattern: String,
+    /// Slug, or "all".
+    project: Option<String>,
+    /// Lines around each match; default 2.
+    context: Option<usize>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 struct NextTaskArgs {
     /// Slug, or "all".
     project: Option<String>,
@@ -285,6 +440,29 @@ struct NextTaskArgs {
 }
 
 impl Kanzo {
+    /// The shared board a joined one sends calls to can't see this computer's files: a file
+    /// to write a page from is read here and its text sent instead.
+    fn files_here(
+        &self,
+        tool: &str,
+        args: &mut Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        let Some(args) = args else { return Ok(()) };
+        if tool == "read_wiki_page" && args.contains_key("to_file") {
+            return Err("to_file doesn't work on a shared board; read the page without it".into());
+        }
+        if tool == "write_wiki_page"
+            && let Some(file) = args.remove("file")
+        {
+            if args.contains_key("body") {
+                return Err("pass body or file, not both".into());
+            }
+            let path = self.ctx.page_path(file.as_str().unwrap_or_default(), false).map_err(|e| e.to_string())?;
+            args.insert("body".into(), page_file(&path).map_err(|e| e.to_string())?.into());
+        }
+        Ok(())
+    }
+
     /// Drops rmcp's `$schema` line and the `null` of optional fields: agents read this list in
     /// every session, so each byte counts.
     fn tools() -> ToolRouter<Self> {
@@ -336,6 +514,7 @@ impl Kanzo {
                     .collect(),
                 images: header(share::IMAGES_HEADER).map_or_else(|| self.ctx.images.clone(), PathBuf::from),
                 host: Default::default(),
+                files: false,
             }),
             None => self.ctx.clone(),
         };
@@ -367,6 +546,13 @@ impl Kanzo {
                         let _ = write!(out, " ({})", p.repos.join(", "));
                     }
                     let _ = write!(out, ": {} open of {}", p.open, p.total);
+                    match p.pages {
+                        0 => {}
+                        1 => out.push_str(", 1 wiki page"),
+                        n => {
+                            let _ = write!(out, ", {n} wiki pages");
+                        }
+                    }
                     if here.is_some_and(|h| h.id == p.id) {
                         out.push_str(" <- current repo");
                     }
@@ -589,6 +775,165 @@ impl Kanzo {
             })
             .await)
     }
+
+    #[tool(description = "List wiki pages with their line counts.")]
+    async fn list_wiki_pages(
+        &self,
+        Parameters(args): Parameters<WikiArgs>,
+        ext: Extensions,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(self
+            .run_for(&ext, move |ctx, store| {
+                let project = ctx.scope(store, args.project.as_deref())?;
+                let pages = store.list_pages(project.as_ref().map(|p| p.id), "")?;
+                if pages.is_empty() {
+                    let scope = project.map_or("any project".into(), |p| p.slug);
+                    return Ok(format!("No wiki pages in {scope}. Add one with write_wiki_page."));
+                }
+                let mut out = String::new();
+                for page in &pages {
+                    if project.is_none() {
+                        let _ = write!(out, "{}/", page.project);
+                    }
+                    let lines = if page.lines == 1 { "line" } else { "lines" };
+                    let _ = writeln!(
+                        out,
+                        "{} ({} {lines}, updated {})",
+                        page.title,
+                        page.lines,
+                        short_time(&page.updated_at)
+                    );
+                }
+                out.pop();
+                Ok(out)
+            })
+            .await)
+    }
+
+    #[tool(description = "Read a wiki page, or some of its lines, like those grep_wiki found, or save it to a file.")]
+    async fn read_wiki_page(
+        &self,
+        Parameters(args): Parameters<ReadPageArgs>,
+        ext: Extensions,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(self
+            .run_for(&ext, move |ctx, store| {
+                let project = ctx.project(store, args.project.as_deref())?;
+                let page = store.find_page(project.id, &args.title)?;
+                if let Some(to) = &args.to_file {
+                    use std::io::Write as _;
+                    let path = ctx.page_path(to, true)?;
+                    let cannot = |e: std::io::Error| Error::Invalid(format!("cannot write {to}: {e}"));
+                    // create_new: never over a file that appeared since the check.
+                    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(cannot)?;
+                    file.write_all(page.body.as_bytes()).map_err(cannot)?;
+                    return Ok(format!(
+                        "Saved wiki page {} ({} lines) to {}. To save changes made there, call write_wiki_page with file.",
+                        page.title,
+                        page.body.lines().count(),
+                        to.trim()
+                    ));
+                }
+                let lines: Vec<&str> = page.body.lines().collect();
+                let first = args.offset.unwrap_or(1).max(1);
+                let count = args.limit.unwrap_or(lines.len());
+                let shown: Vec<&str> = lines.iter().skip(first - 1).take(count).copied().collect();
+                let by = if page.author.is_empty() { String::new() } else { format!(" by {}", page.author) };
+                let mut out =
+                    format!("{} ({}), updated {}{by}", page.title, page.project, short_time(&page.updated_at));
+                if lines.is_empty() {
+                    out.push_str("\n\n(empty)");
+                } else if shown.is_empty() {
+                    let _ = write!(out, "\n\n(it has {} lines)", lines.len());
+                } else {
+                    if shown.len() < lines.len() {
+                        let _ = write!(out, ", lines {}-{} of {}", first, first + shown.len() - 1, lines.len());
+                    }
+                    let _ = write!(out, "\n\n{}", shown.join("\n"));
+                }
+                Ok(out)
+            })
+            .await)
+    }
+
+    #[tool(
+        description = "Create a wiki page, or replace all its text. For long text, write it to a file and pass file."
+    )]
+    async fn write_wiki_page(
+        &self,
+        Parameters(args): Parameters<WritePageArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = caller(&context).map(|i| i.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "agent".into());
+        Ok(self
+            .run_for(&context.extensions, move |ctx, store| {
+                let project = ctx.project(store, args.project.as_deref())?;
+                let body = match (args.body, args.file) {
+                    (Some(_), Some(_)) => return Err(Error::Invalid("pass body or file, not both".into())),
+                    (Some(body), None) => body,
+                    (None, Some(file)) => page_file(&ctx.page_path(&file, false)?)?,
+                    (None, None) => return Err(Error::Invalid("pass the text as body, or as a local file".into())),
+                };
+                let (page, created) = store.write_page(project.id, &args.title, &body, &author)?;
+                let did = if created { "Created" } else { "Saved" };
+                Ok(format!("{did} wiki page {} in {} ({} lines).", page.title, page.project, page.body.lines().count()))
+            })
+            .await)
+    }
+
+    #[tool(description = "Replace exact text in a wiki page, without sending the whole page.")]
+    async fn edit_wiki_page(
+        &self,
+        Parameters(args): Parameters<EditPageArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let author = caller(&context).map(|i| i.name).filter(|n| !n.is_empty()).unwrap_or_else(|| "agent".into());
+        Ok(self
+            .run_for(&context.extensions, move |ctx, store| {
+                let project = ctx.project(store, args.project.as_deref())?;
+                let all = args.all.unwrap_or(false);
+                let (page, n) = store.edit_page(project.id, &args.title, &args.old, &args.new, all, &author)?;
+                let places = if n == 1 { String::new() } else { format!(" in {n} places") };
+                Ok(format!("Edited wiki page {}{places}.", page.title))
+            })
+            .await)
+    }
+
+    #[tool(description = "Search wiki pages by regex: matching lines with their numbers and a little context.")]
+    async fn grep_wiki(
+        &self,
+        Parameters(args): Parameters<GrepWikiArgs>,
+        ext: Extensions,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(self
+            .run_for(&ext, move |ctx, store| {
+                let project = ctx.scope(store, args.project.as_deref())?;
+                let context = args.context.unwrap_or(2).min(20);
+                let grep = store.grep_pages(project.as_ref().map(|p| p.id), &args.pattern, context, GREP_MATCHES)?;
+                let scope = project.as_ref().map_or("any project", |p| p.slug.as_str());
+                if grep.pages.is_empty() {
+                    return Ok(format!("No wiki matches for {:?} in {scope}.", args.pattern));
+                }
+                Ok(grep_text(&grep, project.is_none()))
+            })
+            .await)
+    }
+
+    #[tool(description = "Delete a wiki page. Can't be undone.")]
+    async fn delete_wiki_page(
+        &self,
+        Parameters(args): Parameters<PageArgs>,
+        ext: Extensions,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(self
+            .run_for(&ext, move |ctx, store| {
+                let project = ctx.project(store, args.project.as_deref())?;
+                let page = store.find_page(project.id, &args.title)?;
+                store.delete_page(page.id)?;
+                Ok(format!("Deleted wiki page {} from {}.", page.title, page.project))
+            })
+            .await)
+    }
 }
 
 // Serve the router built once in `tools()`; by default the macro builds a new,
@@ -611,7 +956,11 @@ impl ServerHandler for Kanzo {
             }
             let client = share::handshake(context.peer.peer_info().as_deref(), &context.meta);
             let upstream = upstream.as_mut().expect("set above");
-            let outcome = upstream.call(client, &request.name, request.arguments).await;
+            let mut arguments = request.arguments;
+            if let Err(e) = self.files_here(&request.name, &mut arguments) {
+                return Ok(reply(Err(e)).into());
+            }
+            let outcome = upstream.call(client, &request.name, arguments).await;
             return Ok(reply(outcome).into());
         }
         self.tool_router.call(ToolCallContext::new(self, request, context)).await
@@ -622,6 +971,34 @@ impl ServerHandler for Kanzo {
             .with_server_info(Implementation::new("kanzo", env!("CARGO_PKG_VERSION")))
             .with_instructions(if self.ctx.cwd.is_some() { INSTRUCTIONS } else { HTTP_INSTRUCTIONS })
     }
+}
+
+/// Like grep's output: `title:12:text` for a match, `title-13-text` around one, `--` between groups.
+fn grep_text(grep: &Grep, all: bool) -> String {
+    let mut out = String::new();
+    for page in &grep.pages {
+        let name = if all { format!("{}/{}", page.project, page.title) } else { page.title.clone() };
+        if !out.is_empty() {
+            out.push_str("--\n");
+        }
+        if page.title_matches && page.lines.is_empty() {
+            let _ = writeln!(out, "{name}: (the title matches)");
+        }
+        let mut last = None;
+        for line in &page.lines {
+            if last.is_some_and(|n| n + 1 != line.number) {
+                out.push_str("--\n");
+            }
+            let sep = if line.matched { ':' } else { '-' };
+            let _ = writeln!(out, "{name}{sep}{}{sep}{}", line.number, line.text);
+            last = Some(line.number);
+        }
+    }
+    if grep.more {
+        let _ = writeln!(out, "(stopped at {} matches; narrow the pattern)", grep.matches);
+    }
+    out.pop();
+    out
 }
 
 fn shown(hidden: &[String], property: &str) -> bool {
@@ -742,7 +1119,14 @@ mod tests {
     impl Agent {
         fn start(home: Home, folder: &std::path::Path) -> Self {
             let images = home.images();
-            let ctx = Ctx { home, cwd: Some(folder.into()), repos: Vec::new(), images, host: Default::default() };
+            let ctx = Ctx {
+                home,
+                cwd: Some(folder.into()),
+                repos: Vec::new(),
+                images,
+                host: Default::default(),
+                files: true,
+            };
             let server = Kanzo { ctx: Arc::new(ctx), tool_router: Kanzo::tools() };
             let (ours, theirs) = tokio::io::duplex(1 << 16);
             tokio::spawn(async move { server.serve(tokio::io::split(theirs)).await.unwrap().waiting().await });
@@ -834,6 +1218,154 @@ mod tests {
             home.store().unwrap().set_property("waiting", false).unwrap();
             assert!(!call("get_task", json!({ "id": "api#2" })).await.contains("waits on"));
         });
+    }
+
+    #[test]
+    fn agents_grep_the_wiki_then_read_and_edit_only_what_they_need() {
+        block_on(async {
+            let (dir, home, _) = board();
+            let mut agent = Agent::start(home.clone(), dir.path());
+            let mut call = async |name: &str, args: Value| -> String {
+                let params = json!({ "name": name, "arguments": args, "_meta": stateless(Some("claude-code")) });
+                let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params });
+                let reply = agent.send(message).await.unwrap();
+                reply["result"]["content"][0]["text"].as_str().unwrap().to_string()
+            };
+            let body = "# Setup\n\nInstall Rust.\nRun `cargo build`.\n\n# Deploy\n\nTag a release.\nThe CI builds it.";
+            let made = call("write_wiki_page", json!({ "title": "Runbook", "body": body, "project": "api" })).await;
+            assert_eq!(made, "Created wiki page Runbook in api (9 lines).");
+            call("write_wiki_page", json!({ "title": "Build notes", "body": "cargo is slow", "project": "api" })).await;
+
+            let grep = call("grep_wiki", json!({ "pattern": "build", "project": "api", "context": 1 })).await;
+            assert_eq!(
+                grep,
+                "Build notes: (the title matches)\n--\nRunbook-3-Install Rust.\nRunbook:4:Run `cargo build`.\nRunbook-5-\n--\nRunbook-8-Tag a release.\nRunbook:9:The CI builds it."
+            );
+            let everywhere = call("grep_wiki", json!({ "pattern": "Tag", "project": "all", "context": 0 })).await;
+            assert_eq!(everywhere, "api/Runbook:8:Tag a release.");
+
+            let read =
+                call("read_wiki_page", json!({ "title": "runbook", "project": "api", "offset": 8, "limit": 2 })).await;
+            assert!(read.starts_with("Runbook (api), updated "), "{read}");
+            assert!(read.contains("by claude-code, lines 8-9 of 9\n\nTag a release.\nThe CI builds it."), "{read}");
+
+            let edited = call(
+                "edit_wiki_page",
+                json!({ "title": "Runbook", "old": "Tag a release.", "new": "Run `kanzo update`.", "project": "api" }),
+            )
+            .await;
+            assert_eq!(edited, "Edited wiki page Runbook.");
+            let page = home.store().unwrap().find_page(1, "Runbook").unwrap();
+            assert!(page.body.contains("Run `kanzo update`.\nThe CI"), "{}", page.body);
+
+            let listed = call("list_wiki_pages", json!({ "project": "api" })).await;
+            assert!(
+                listed.starts_with("Build notes (1 line, updated ") && listed.contains("\nRunbook (9 lines, "),
+                "{listed}"
+            );
+            assert!(call("list_projects", json!({})).await.contains("api: 1 open of 1, 2 wiki pages"));
+            let gone = call("delete_wiki_page", json!({ "title": "Build notes", "project": "api" })).await;
+            assert_eq!(gone, "Deleted wiki page Build notes from api.");
+            let missing = call("read_wiki_page", json!({ "title": "Build notes", "project": "api" })).await;
+            assert_eq!(missing, "no wiki page \"Build notes\" (pages: Runbook)");
+        });
+    }
+
+    #[test]
+    fn agents_write_long_pages_from_files_and_save_them_to_files() {
+        block_on(async {
+            let (dir, home, _) = board();
+            let mut agent = Agent::start(home.clone(), dir.path());
+            let mut call = async |name: &str, args: Value| -> (bool, String) {
+                let params = json!({ "name": name, "arguments": args, "_meta": stateless(None) });
+                let message = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params });
+                let result = agent.send(message).await.unwrap()["result"].clone();
+                (
+                    result["isError"].as_bool().unwrap_or(false),
+                    result["content"][0]["text"].as_str().unwrap().to_string(),
+                )
+            };
+            let long: String = (1..=2000).map(|i| format!("Line {i} of a long page.\r\n")).collect();
+            std::fs::write(dir.path().join("notes.md"), &long).unwrap();
+            let (failed, made) =
+                call("write_wiki_page", json!({ "title": "Notes", "file": "notes.md", "project": "api" })).await;
+            assert!(!failed, "{made}");
+            assert_eq!(made, "Created wiki page Notes in api (2000 lines).");
+            let page = home.store().unwrap().find_page(1, "Notes").unwrap();
+            assert_eq!(page.body, long.replace("\r\n", "\n"), "Windows line ends are made plain");
+
+            let to = json!({ "title": "Notes", "project": "api", "to_file": "copy.md" });
+            let (failed, saved) = call("read_wiki_page", to).await;
+            assert!(!failed && saved.starts_with("Saved wiki page Notes (2000 lines) to "), "{saved}");
+            assert_eq!(std::fs::read_to_string(dir.path().join("copy.md")).unwrap(), page.body);
+
+            let both = json!({ "title": "Notes", "body": "x", "file": "notes.md", "project": "api" });
+            let (failed, text) = call("write_wiki_page", both).await;
+            assert!(failed && text.contains("not both"), "{text}");
+            let (failed, text) =
+                call("write_wiki_page", json!({ "title": "Notes", "file": "nope.md", "project": "api" })).await;
+            assert!(failed && text.contains("cannot read"), "{text}");
+            let (failed, text) = call("write_wiki_page", json!({ "title": "Notes", "project": "api" })).await;
+            assert!(failed && text.contains("pass the text"), "{text}");
+        });
+    }
+
+    #[test]
+    fn the_board_over_http_never_reads_or_writes_files() {
+        let (dir, home, _) = board();
+        let images = home.images();
+        let ctx = Ctx {
+            home,
+            cwd: Some(dir.path().into()),
+            repos: Vec::new(),
+            images,
+            host: Default::default(),
+            files: false,
+        };
+        let err = ctx.page_path("notes.md", false).unwrap_err().to_string();
+        assert!(err.contains("only through `kanzo mcp`"), "{err}");
+    }
+
+    #[test]
+    fn page_files_stay_inside_the_agents_folder_and_are_text() {
+        let (dir, home, _) = board();
+        let images = home.images();
+        let work = dir.path().join("repo");
+        std::fs::create_dir_all(work.join("docs")).unwrap();
+        std::fs::write(work.join("docs/notes.md"), "notes").unwrap();
+        std::fs::write(work.join(".env"), "SECRET=1").unwrap();
+        std::fs::write(dir.path().join("outside.md"), "not yours").unwrap();
+        let ctx =
+            Ctx { home, cwd: Some(work.clone()), repos: Vec::new(), images, host: Default::default(), files: true };
+        let refused = |given: &str, new: bool| ctx.page_path(given, new).unwrap_err().to_string();
+
+        assert!(ctx.page_path("docs/notes.md", false).is_ok());
+        assert!(ctx.page_path("docs/new.md", true).is_ok());
+        assert!(refused("../outside.md", false).contains("outside"));
+        let absolute = dir.path().join("outside.md").display().to_string();
+        assert!(refused(&absolute, false).contains("outside"));
+        assert!(refused(".env", false).contains("not a .md"));
+        assert!(refused("docs/notes.md", true).contains("already exists"), "to_file never overwrites");
+        assert!(refused("../new.md", true).contains("outside"));
+        assert!(refused("missing/new.md", true).contains("cannot write"));
+        let nowhere = dir.path().join("no-such-file.md").display().to_string();
+        assert!(refused(&nowhere, false).contains("outside"), "a missing file elsewhere is only outside");
+        assert!(refused("docs/../../outside.md", false).contains("outside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_counts_where_it_leads() {
+        let (dir, home, _) = board();
+        let images = home.images();
+        let work = dir.path().join("repo");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(dir.path().join("id_rsa"), "key").unwrap();
+        std::os::unix::fs::symlink(dir.path().join("id_rsa"), work.join("key.md")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), work.join("up")).unwrap();
+        let ctx = Ctx { home, cwd: Some(work), repos: Vec::new(), images, host: Default::default(), files: true };
+        assert!(ctx.page_path("key.md", false).unwrap_err().to_string().contains("outside"));
+        assert!(ctx.page_path("up/new.md", true).unwrap_err().to_string().contains("outside"));
     }
 
     #[test]

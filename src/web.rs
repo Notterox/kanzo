@@ -192,6 +192,8 @@ fn router(home: Home, guard: Arc<Guard>, shutdown: CancellationToken) -> Router 
         .route("/api/projects/{slug}", patch(update_project).delete(delete_project))
         .route("/api/projects/{slug}/repos", post(link_repo).delete(unlink_repo))
         .route("/api/projects/{slug}/move", post(move_project))
+        .route("/api/projects/{slug}/wiki", get(list_pages).post(create_page))
+        .route("/api/wiki/{id}", get(get_page).patch(update_page).delete(delete_page))
         .route("/api/tasks", post(create_task))
         .route("/api/tasks/bulk", post(bulk_tasks))
         .route("/api/tasks/move", post(move_tasks))
@@ -680,6 +682,47 @@ async fn delete_project(State(home): Shared, Path(slug): Path<String>) -> Respon
         h.deleting_images(s, ImagesOf::Project(project.id), || s.delete_project(&slug))
     })
     .await
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn list_pages(State(home): Shared, Path(slug): Path<String>, Query(q): Query<PageQuery>) -> Response {
+    with_store(home, move |_, s| s.list_pages(Some(s.find_project(&slug)?.id), &q.q)).await
+}
+
+#[derive(Deserialize)]
+struct NewPage {
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn create_page(State(home): Shared, Path(slug): Path<String>, Json(p): Json<NewPage>) -> Response {
+    with_store(home, move |_, s| s.create_page(s.find_project(&slug)?.id, &p.title, &p.body, "me")).await
+}
+
+async fn get_page(State(home): Shared, Path(id): Path<i64>) -> Response {
+    with_store(home, move |_, s| s.get_page(id)).await
+}
+
+#[derive(Deserialize)]
+struct PagePatch {
+    title: Option<String>,
+    body: Option<String>,
+    /// The version the page was at when the editor opened it.
+    version: Option<i64>,
+}
+
+async fn update_page(State(home): Shared, Path(id): Path<i64>, Json(p): Json<PagePatch>) -> Response {
+    with_store(home, move |_, s| s.update_page(id, p.title.as_deref(), p.body.as_deref(), "me", p.version)).await
+}
+
+async fn delete_page(State(home): Shared, Path(id): Path<i64>) -> Response {
+    with_store(home, move |_, s| s.delete_page(id)).await
 }
 
 #[derive(Deserialize)]

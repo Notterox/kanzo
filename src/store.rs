@@ -13,6 +13,10 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 
+mod wiki;
+
+pub use wiki::{Grep, PAGE_MAX};
+
 /// The oldest schema version whose Kanzo can still use a database at the latest one.
 /// Adding a table or a column with a default leaves older versions working, so a board
 /// synced from a newer Kanzo still opens in an older one. Raise it to the new version
@@ -165,6 +169,7 @@ pub struct Project {
     pub created_at: String,
     pub open: i64,
     pub total: i64,
+    pub pages: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -387,9 +392,18 @@ impl Store {
         let latest = MIGRATIONS.len();
         let current =
             (meta(&self.conn, "schema_version").unwrap_or(None), meta(&self.conn, "compatible").unwrap_or(None));
-        if current == (Some(latest), Some(COMPATIBLE_FROM)) {
+        let has_wiki = meta(&self.conn, "wiki").unwrap_or(None) == Some(1);
+        if current == (Some(latest), Some(COMPATIBLE_FROM)) && has_wiki {
             return Ok(());
         }
+        // A board last saved by a Kanzo without the wiki, maybe synced from another machine, gets it here.
+        let add_wiki = |c: &Connection| -> Result<()> {
+            if meta(c, "wiki")? != Some(1) {
+                c.execute_batch(wiki::SCHEMA)?;
+                c.execute("INSERT INTO meta (key, value) VALUES ('wiki', '1') ON CONFLICT(key) DO UPDATE SET value = excluded.value", [])?;
+            }
+            Ok(())
+        };
         self.write(|c| {
             c.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)", [])?;
             let version = meta(c, "schema_version")?.unwrap_or(0);
@@ -397,7 +411,7 @@ impl Store {
                 // From a newer Kanzo, maybe synced from another machine: use it as it is
                 // when this version can, without touching its schema.
                 if meta(c, "compatible")?.is_some_and(|oldest| oldest <= latest) {
-                    return Ok(());
+                    return add_wiki(c);
                 }
                 return Err(Error::Invalid(
                     "this board was saved by a newer version of Kanzo; update this one with `kanzo update`".into(),
@@ -411,7 +425,7 @@ impl Store {
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [latest.to_string(), COMPATIBLE_FROM.to_string()],
             )?;
-            Ok(())
+            add_wiki(c)
         })
     }
 
@@ -554,7 +568,8 @@ impl Store {
             (SELECT group_concat(repo, ',' ORDER BY r.rowid) FROM project_repos r WHERE r.project_id = p.id),
             p.color, p.created_at,
             (SELECT count(*) FROM tasks t WHERE t.project_id = p.id AND t.status <> ?1),
-            (SELECT count(*) FROM tasks t WHERE t.project_id = p.id)
+            (SELECT count(*) FROM tasks t WHERE t.project_id = p.id),
+            (SELECT count(*) FROM wiki_pages w WHERE w.project_id = p.id)
         FROM projects p";
 
     fn project_row(r: &Row) -> rusqlite::Result<Project> {
@@ -567,6 +582,7 @@ impl Store {
             created_at: r.get(5)?,
             open: r.get(6)?,
             total: r.get(7)?,
+            pages: r.get(8)?,
         })
     }
 
@@ -732,7 +748,7 @@ impl Store {
 
     pub fn delete_project(&self, slug: &str) -> Result<Project> {
         let project = self.find_project(slug)?;
-        // Tasks and comments go with it through ON DELETE CASCADE.
+        // Tasks, comments and wiki pages go with it through ON DELETE CASCADE.
         self.conn.execute("DELETE FROM projects WHERE id = ?1", [project.id])?;
         Ok(project)
     }
